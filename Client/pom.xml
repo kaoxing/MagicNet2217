@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>top.kaoxing</groupId>
+        <artifactId>MagicNet2217</artifactId>
+        <version>1.0</version>
+    </parent>
+
+    <artifactId>Client</artifactId>
+
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+    <build>
+        <plugins>
+            <!-- 1) 先生成 -shaded.jar -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.1</version>
+                <executions>
+                    <execution>
+                        <id>shade-fat-jar</id>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                            <!-- 关键：附加 -shaded 产物，不覆盖原jar -->
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>top.kaoxing.Main</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- 2) 复制 shaded.jar 到干净的 input 目录（避免递归） -->
+            <plugin>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <execution>
+                        <id>prep-jpkg-input</id>
+                        <phase>package</phase>
+                        <configuration>
+                            <target>
+                                <mkdir dir="${project.build.directory}/jpkg-in"/>
+                                <copy file="${project.build.directory}/${project.build.finalName}-shaded.jar"
+                                      tofile="${project.build.directory}/jpkg-in/${project.build.finalName}-shaded.jar"
+                                      overwrite="true"/>
+                            </target>
+                        </configuration>
+                        <goals><goal>run</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- 3) jpackage 生成可运行目录（APP_IMAGE），输出到独立目录 -->
+            <plugin>
+                <groupId>org.panteleyev</groupId>
+                <artifactId>jpackage-maven-plugin</artifactId>
+                <version>1.7.1</version>
+                <configuration>
+                    <name>SSClient</name>
+                    <destination>${project.build.directory}/jpkg-out</destination>
+                    <input>${project.build.directory}/jpkg-in</input>
+                    <mainJar>${project.build.finalName}-shaded.jar</mainJar>
+                    <mainClass>top.kaoxing.Main</mainClass>
+
+                    <type>APP_IMAGE</type> <!-- 无需 WiX -->
+                    <vendor>kaoxing</vendor>
+                    <appVersion>1.0.0</appVersion>
+
+                    <jLinkOptions>
+                        <option>--strip-debug</option>
+                        <option>--no-header-files</option>
+                        <option>--no-man-pages</option>
+                        <option>--compress=1</option> <!-- 稳妥些；2也行 -->
+                    </jLinkOptions>
+
+                    <removeDestination>true</removeDestination>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>pkg</id>
+                        <phase>package</phase>
+                        <goals><goal>jpackage</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+
+
+</project>

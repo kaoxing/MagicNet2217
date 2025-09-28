@@ -1,0 +1,5 @@
+listen_port: 7000
+server_host: localhost
+server_port: 8001
+use_encryption: true
+encryption_key: "password"
