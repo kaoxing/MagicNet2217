@@ -12,6 +12,7 @@ class ConfigData {
     public String password;
     public boolean use_encryption;
     public String encryption_key;
+    public boolean desktop;
 
     public List<Host> server_hosts;
 
@@ -30,6 +31,7 @@ public class Config {
     public static final boolean AUTHENTICATION_ENABLED;
     public static final String USERNAME;
     public static final String AUTH_PASSWORD;
+    public static final boolean DESKTOP;
     static{
         Yaml yaml = new Yaml();
         InputStream inputStream = Config.class.getClassLoader().getResourceAsStream("config.yml");
@@ -42,6 +44,7 @@ public class Config {
         AUTHENTICATION_ENABLED = configData.enable_authentication;
         USERNAME = configData.username;
         AUTH_PASSWORD = configData.password;
+        DESKTOP = configData.desktop;
     }
     public static void selectHost(int index) {
         if (index < 0 || index >= server_hosts.size()) {
