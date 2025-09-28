@@ -3,7 +3,7 @@ LABEL authors="kaoxing"
 
 EXPOSE 8001
 
-ARG JAR_FILE=Server-1.0-shaded.jar
+ARG JAR_FILE=Server-1.0.jar
 
 ADD target/${JAR_FILE} /app.jar
 

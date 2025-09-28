@@ -39,7 +39,6 @@ public class ProxyClient {
 
     public static void run() throws IOException {
         // 先尝试连接上游服务器，不停重试
-
         AppLogger.info("Connecting to server " + Config.SERVER_HOST + ":" + Config.SERVER_PORT + " ...");
         while (true) {
             try (SocketChannel test = SocketChannel.open()) {
@@ -47,7 +46,7 @@ public class ProxyClient {
                 test.connect(new InetSocketAddress(Config.SERVER_HOST, Config.SERVER_PORT));
                 AppLogger.info("Connected to server successfully.");
                 break;
-            } catch (IOException e) {
+            } catch (Exception e) {
                 AppLogger.warning("Failed to connect to server, retrying in 3 seconds...");
                 try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
             }
@@ -291,13 +290,14 @@ public class ProxyClient {
         }
     }
 
-    // === SOCKS5 握手 ===
+
     static void readFully(SocketChannel sc, ByteBuffer buf) throws IOException {
         while (buf.hasRemaining()) {
             if (sc.read(buf) < 0) throw new EOFException("stream closed");
         }
     }
 
+    // === SOCKS5 握手 ===
     static ShakeHandResult socks5ShakeHand(SocketChannel sc) {
         ByteBuffer buf = ByteBuffer.allocate(2);
         try {
@@ -316,24 +316,91 @@ public class ProxyClient {
             buf = ByteBuffer.allocate(nMethods);
             readFully(sc, buf);
             buf.flip();
-            boolean noAuth = false;
-            for (int i = 0; i < nMethods; i++) {
-                if (buf.get() == 0x00) {
-                    noAuth = true;
-                    break;
+
+            // 支持0x00:noAuth和0x02:用户/密码两种认证方式
+            // 但是取决于本地config
+            if (!Config.AUTHENTICATION_ENABLED){
+                boolean noAuth = false;
+                for (int i = 0; i < nMethods; i++) {
+                    if (buf.get() == 0x00) {
+                        noAuth = true;
+                        break;
+                    }
                 }
-            }
-            if (!noAuth) {
-                AppLogger.error("No supported authentication methods");
-                return ShakeHandResult.FAILED;
+                if (!noAuth) {
+                    AppLogger.error("No supported authentication methods");
+                    return ShakeHandResult.FAILED;
+                }
             }
 
             // 2. 服务器选择认证方法
-            buf = ByteBuffer.allocate(2);
-            buf.put((byte) 0x05);
-            buf.put((byte) 0x00);
-            buf.flip();
-            sc.write(buf);
+            if(Config.AUTHENTICATION_ENABLED){
+                // 选择 0x02:用户名/密码认证
+                buf = ByteBuffer.allocate(2);
+                buf.put((byte) 0x05);
+                buf.put((byte) 0x02);
+                buf.flip();
+                sc.write(buf);
+
+                // 用户名/密码认证子协商
+                // 读取版本号、用户名长度、用户名、密码长度、密码
+                buf = ByteBuffer.allocate(2);
+                readFully(sc, buf);
+                buf.flip();
+                if (buf.get() != 0x01) {
+                    AppLogger.warning("Unsupported auth version: " + buf.get(0));
+                    return ShakeHandResult.FAILED;
+                }
+
+                int ulen = buf.get() & 0xFF;
+                if (ulen <= 0 || ulen > 255) {
+                    AppLogger.warning("Invalid username length: " + ulen);
+                    return ShakeHandResult.FAILED;
+                }
+                buf = ByteBuffer.allocate(ulen + 1);
+                readFully(sc, buf);
+                buf.flip();
+                byte[] unameBytes = new byte[ulen];
+                buf.get(unameBytes);
+                String username = new String(unameBytes, StandardCharsets.US_ASCII);
+                int plen = buf.get() & 0xFF;
+                if (plen <= 0 || plen > 255) {
+                    AppLogger.warning("Invalid password length: " + plen);
+                    return ShakeHandResult.FAILED;
+                }
+                buf = ByteBuffer.allocate(plen);
+                readFully(sc, buf);
+                buf.flip();
+                byte[] passwdBytes = new byte[plen];
+                buf.get(passwdBytes);
+                String password = new String(passwdBytes, StandardCharsets.US_ASCII);
+                // 验证用户名和密码
+                if (!username.equals(Config.USERNAME) || !password.equals(Config.AUTH_PASSWORD)) {
+                    AppLogger.warning("Authentication failed for user: " + username);
+                    // 认证失败
+                    buf = ByteBuffer.allocate(2);
+                    buf.put((byte) 0x01);
+                    buf.put((byte) 0x01); // 失败
+                    buf.flip();
+                    sc.write(buf);
+                    return ShakeHandResult.FAILED;
+                } else {
+                    // 认证成功
+                    buf = ByteBuffer.allocate(2);
+                    buf.put((byte) 0x01);
+                    buf.put((byte) 0x00); // 成功
+                    buf.flip();
+                    sc.write(buf);
+                }
+            }else{
+                // 选择 0x00:无认证
+                buf = ByteBuffer.allocate(2);
+                buf.put((byte) 0x05);
+                buf.put((byte) 0x00);
+                buf.flip();
+                sc.write(buf);
+            }
+
 
             // 3. 客户端请求
             buf = ByteBuffer.allocate(4);

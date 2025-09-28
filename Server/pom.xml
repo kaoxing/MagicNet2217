@@ -14,24 +14,35 @@
     <properties>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
+        <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
     <build>
         <plugins>
-            <!-- 1) 先生成 -shaded.jar -->
+            <!-- 编译到 Java 21 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                </configuration>
+            </plugin>
+
+            <!-- 生成可执行的 fat jar（不带 -shaded 后缀，文件名就是 ${finalName}.jar） -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
                 <version>3.5.1</version>
                 <executions>
                     <execution>
-                        <id>shade-fat-jar</id>
+                        <id>shade</id>
                         <phase>package</phase>
                         <goals><goal>shade</goal></goals>
                         <configuration>
-                            <!-- 关键：附加 -shaded 产物，不覆盖原jar -->
-                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <!-- 用 fat jar 覆盖原 jar，便于 Docker COPY app.jar -->
+                            <shadedArtifactAttached>false</shadedArtifactAttached>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
@@ -42,62 +53,90 @@
                     </execution>
                 </executions>
             </plugin>
-
-            <!-- 2) 复制 shaded.jar 到干净的 input 目录（避免递归） -->
-            <plugin>
-                <artifactId>maven-antrun-plugin</artifactId>
-                <version>3.1.0</version>
-                <executions>
-                    <execution>
-                        <id>prep-jpkg-input</id>
-                        <phase>package</phase>
-                        <configuration>
-                            <target>
-                                <mkdir dir="${project.build.directory}/jpkg-in"/>
-                                <copy file="${project.build.directory}/${project.build.finalName}-shaded.jar"
-                                      tofile="${project.build.directory}/jpkg-in/${project.build.finalName}-shaded.jar"
-                                      overwrite="true"/>
-                            </target>
-                        </configuration>
-                        <goals><goal>run</goal></goals>
-                    </execution>
-                </executions>
-            </plugin>
-
-            <!-- 3) jpackage 生成可运行目录（APP_IMAGE），输出到独立目录 -->
-            <plugin>
-                <groupId>org.panteleyev</groupId>
-                <artifactId>jpackage-maven-plugin</artifactId>
-                <version>1.7.1</version>
-                <configuration>
-                    <name>SSServer</name>
-                    <destination>${project.build.directory}/jpkg-out</destination>
-                    <input>${project.build.directory}/jpkg-in</input>
-                    <mainJar>${project.build.finalName}-shaded.jar</mainJar>
-                    <mainClass>top.kaoxing.Main</mainClass>
-
-                    <type>APP_IMAGE</type> <!-- 无需 WiX -->
-                    <vendor>kaoxing</vendor>
-                    <appVersion>1.0.0</appVersion>
-
-                    <jLinkOptions>
-                        <option>--strip-debug</option>
-                        <option>--no-header-files</option>
-                        <option>--no-man-pages</option>
-                        <option>--compress=1</option> <!-- 稳妥些；2也行 -->
-                    </jLinkOptions>
-
-                    <removeDestination>true</removeDestination>
-                </configuration>
-                <executions>
-                    <execution>
-                        <id>pkg</id>
-                        <phase>package</phase>
-                        <goals><goal>jpackage</goal></goals>
-                    </execution>
-                </executions>
-            </plugin>
         </plugins>
     </build>
+
+<!--    <build>-->
+<!--        <plugins>-->
+<!--            &lt;!&ndash; 1) 先生成 -shaded.jar &ndash;&gt;-->
+<!--            <plugin>-->
+<!--                <groupId>org.apache.maven.plugins</groupId>-->
+<!--                <artifactId>maven-shade-plugin</artifactId>-->
+<!--                <version>3.5.1</version>-->
+<!--                <executions>-->
+<!--                    <execution>-->
+<!--                        <id>shade-fat-jar</id>-->
+<!--                        <phase>package</phase>-->
+<!--                        <goals><goal>shade</goal></goals>-->
+<!--                        <configuration>-->
+<!--                            &lt;!&ndash; 关键：附加 -shaded 产物，不覆盖原jar &ndash;&gt;-->
+<!--                            <shadedArtifactAttached>true</shadedArtifactAttached>-->
+<!--                            <createDependencyReducedPom>false</createDependencyReducedPom>-->
+<!--                            <transformers>-->
+<!--                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">-->
+<!--                                    <mainClass>top.kaoxing.Main</mainClass>-->
+<!--                                </transformer>-->
+<!--                            </transformers>-->
+<!--                        </configuration>-->
+<!--                    </execution>-->
+<!--                </executions>-->
+<!--            </plugin>-->
+
+<!--            &lt;!&ndash; 2) 复制 shaded.jar 到干净的 input 目录（避免递归） &ndash;&gt;-->
+<!--            <plugin>-->
+<!--                <artifactId>maven-antrun-plugin</artifactId>-->
+<!--                <version>3.1.0</version>-->
+<!--                <executions>-->
+<!--                    <execution>-->
+<!--                        <id>prep-jpkg-input</id>-->
+<!--                        <phase>package</phase>-->
+<!--                        <configuration>-->
+<!--                            <target>-->
+<!--                                <mkdir dir="${project.build.directory}/jpkg-in"/>-->
+<!--                                <copy file="${project.build.directory}/${project.build.finalName}-shaded.jar"-->
+<!--                                      tofile="${project.build.directory}/jpkg-in/${project.build.finalName}-shaded.jar"-->
+<!--                                      overwrite="true"/>-->
+<!--                            </target>-->
+<!--                        </configuration>-->
+<!--                        <goals><goal>run</goal></goals>-->
+<!--                    </execution>-->
+<!--                </executions>-->
+<!--            </plugin>-->
+
+<!--            &lt;!&ndash; 3) jpackage 生成可运行目录（APP_IMAGE），输出到独立目录 &ndash;&gt;-->
+<!--            <plugin>-->
+<!--                <groupId>org.panteleyev</groupId>-->
+<!--                <artifactId>jpackage-maven-plugin</artifactId>-->
+<!--                <version>1.7.1</version>-->
+<!--                <configuration>-->
+<!--                    <name>SSServer</name>-->
+<!--                    <destination>${project.build.directory}/jpkg-out</destination>-->
+<!--                    <input>${project.build.directory}/jpkg-in</input>-->
+<!--                    <mainJar>${project.build.finalName}-shaded.jar</mainJar>-->
+<!--                    <mainClass>top.kaoxing.Main</mainClass>-->
+
+<!--                    <type>APP_IMAGE</type> &lt;!&ndash; 无需 WiX &ndash;&gt;-->
+<!--                    <vendor>kaoxing</vendor>-->
+<!--                    <appVersion>1.0.0</appVersion>-->
+
+<!--                    <jLinkOptions>-->
+<!--                        <option>&#45;&#45;strip-debug</option>-->
+<!--                        <option>&#45;&#45;no-header-files</option>-->
+<!--                        <option>&#45;&#45;no-man-pages</option>-->
+<!--                        <option>&#45;&#45;compress=1</option> &lt;!&ndash; 稳妥些；2也行 &ndash;&gt;-->
+<!--                    </jLinkOptions>-->
+
+<!--                    <removeDestination>true</removeDestination>-->
+<!--                </configuration>-->
+<!--                <executions>-->
+<!--                    <execution>-->
+<!--                        <id>pkg</id>-->
+<!--                        <phase>package</phase>-->
+<!--                        <goals><goal>jpackage</goal></goals>-->
+<!--                    </execution>-->
+<!--                </executions>-->
+<!--            </plugin>-->
+<!--        </plugins>-->
+<!--    </build>-->
 
 </project>
