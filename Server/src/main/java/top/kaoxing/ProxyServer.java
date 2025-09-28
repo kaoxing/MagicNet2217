@@ -62,7 +62,7 @@ public class ProxyServer {
             }
 
             // ===== UDP-over-TCP 模式 =====
-            System.out.println("UDP-over-TCP mode for " + clientChannel.getRemoteAddress());
+//            System.out.println("UDP-over-TCP mode for " + clientChannel.getRemoteAddress());
             DatagramChannel udp = DatagramChannel.open();
             udp.bind(new InetSocketAddress(0)); // 为该 TCP 连接单独开 UDP 口
             udp.configureBlocking(true);
@@ -113,6 +113,7 @@ public class ProxyServer {
                     if (buf.length != 1 + 4 + 2) return null;
                     byte[] ip = new byte[4];
                     b.get(ip);
+//                    AppLogger.info("Client requested IPv4: " + ((ip[0] & 0xFF) + "." + (ip[1] & 0xFF) + "." + (ip[2] & 0xFF) + "." + (ip[3] & 0xFF)));
                     int port = Short.toUnsignedInt(b.getShort());
                     return new InetSocketAddress(java.net.InetAddress.getByAddress(ip), port);
                 }
@@ -122,6 +123,7 @@ public class ProxyServer {
                     if (buf.length != 1 + 1 + n + 2) return null;
                     byte[] name = new byte[n];
                     b.get(name);
+//                    AppLogger.info("Client requested domain: " + new String(name, StandardCharsets.US_ASCII));
                     int port = Short.toUnsignedInt(b.getShort());
                     String host = new String(name, StandardCharsets.US_ASCII);
                     return new InetSocketAddress(host, port);
@@ -130,10 +132,12 @@ public class ProxyServer {
                     if (buf.length != 1 + 16 + 2) return null;
                     byte[] ip6 = new byte[16];
                     b.get(ip6);
+//                    AppLogger.info("Client requested IPv6: " + java.net.InetAddress.getByAddress(ip6).getHostAddress());
                     int port = Short.toUnsignedInt(b.getShort());
                     return new InetSocketAddress(java.net.InetAddress.getByAddress(ip6), port);
                 }
                 default:
+                    AppLogger.warning("Client sent unknown ATYP: " + atyp);
                     return null;
             }
         } catch (Exception ignore) {
@@ -306,7 +310,13 @@ public class ProxyServer {
 
     /** 写一帧：[4B cipher_len][cipher] */
     static void writeCipherFrame(WritableByteChannel ch, byte[] plain) throws IOException {
-        byte[] cipher = (Config.CRYPTION_ENABLED ? Cryptor.encrypt(plain, Config.PASSWORD) : plain);
+        byte[] cipher;
+        try {
+            cipher = (Config.CRYPTION_ENABLED ? Cryptor.encrypt(plain, Config.PASSWORD) : plain);
+        }catch (Exception e) {
+            AppLogger.warning("Encryption error: " + e.getMessage());
+            throw new IOException("Encryption failed", e);
+        }
         if (cipher == null) cipher = new byte[0];
 
         ByteBuffer header = ByteBuffer.allocate(4);

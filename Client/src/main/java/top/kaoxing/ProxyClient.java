@@ -14,15 +14,17 @@ enum Command {
 }
 
 class ShakeHandResult {
-    static final ShakeHandResult FAILED = new ShakeHandResult(Command.FAILED, null, -1);
-    Command command;
-    String destAddr;
-    int destPort;
+    static final ShakeHandResult FAILED = new ShakeHandResult(Command.FAILED, (byte)0, null, -1);
+    final Command command;
+    final byte atyp;       // 原始 ATYP: 0x01/0x03/0x04
+    final String host;     // 若 ATYP=0x03 为域名；ATYP=0x01/0x04 为字面 IP
+    final int port;
 
-    ShakeHandResult(Command command, String destAddr, int destPort) {
+    ShakeHandResult(Command command, byte atyp, String host, int port) {
         this.command = command;
-        this.destAddr = destAddr;
-        this.destPort = destPort;
+        this.atyp = atyp;
+        this.host = host;
+        this.port = port;
     }
 }
 
@@ -36,6 +38,21 @@ public class ProxyClient {
     // 支持CONNECT和UDP ASSOCIATE
 
     public static void run() throws IOException {
+        // 先尝试连接上游服务器，不停重试
+
+        AppLogger.info("Connecting to server " + Config.SERVER_HOST + ":" + Config.SERVER_PORT + " ...");
+        while (true) {
+            try (SocketChannel test = SocketChannel.open()) {
+                test.configureBlocking(true);
+                test.connect(new InetSocketAddress(Config.SERVER_HOST, Config.SERVER_PORT));
+                AppLogger.info("Connected to server successfully.");
+                break;
+            } catch (IOException e) {
+                AppLogger.warning("Failed to connect to server, retrying in 3 seconds...");
+                try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+            }
+        }
+
         try (ServerSocketChannel ssc = ServerSocketChannel.open()) {
             ssc.bind(new InetSocketAddress(Config.LOCAL_PORT));
             AppLogger.info("Proxy Client listening on port " + Config.LOCAL_PORT);
@@ -57,16 +74,17 @@ public class ProxyClient {
 
             // 判断是 CONNECT 还是 UDP ASSOCIATE
             if (shakeHandResult.command == Command.CONNECT) {
-                handleConnect(sc, shakeHandResult.destAddr, shakeHandResult.destPort);
+                handleConnect(sc, shakeHandResult);
             } else {
                 handleUdpAssociate(sc);
             }
+
 
         } catch (IOException ignored) {}
     }
 
     // === CONNECT ===
-    static void handleConnect(SocketChannel sc, String destAddr, int destPort) throws IOException {
+    static void handleConnect(SocketChannel sc, ShakeHandResult shakeHandResult) throws IOException {
         // 1) 先连上游，再回成功
         SocketChannel ssTcp = SocketChannel.open();
         ssTcp.configureBlocking(true);
@@ -80,10 +98,12 @@ public class ProxyClient {
         sc.write(ok);
 
         // 2) 首帧发送 SS 目标头（明文）——> 加密后前置4字节密文长度
-        ByteBuffer ssHeader = buildSsTcpTargetHeader(destAddr, destPort);
+        ByteBuffer ssHeader = buildSsTcpTargetHeader(shakeHandResult);
         byte[] hdrPlain = new byte[ssHeader.remaining()];
         ssHeader.get(hdrPlain);
         writeCipherFrame(ssTcp, hdrPlain);
+
+//        AppLogger.info("CONNECT " + shakeHandResult.host + ":" + shakeHandResult.port);
 
         // 3) 双向转发（显式加/解密 + 4字节密文长度前缀）
         Thread tUp = Thread.startVirtualThread(() -> pipeClientToServer(sc, ssTcp));
@@ -163,22 +183,64 @@ public class ProxyClient {
         }
     }
 
-    // === 构造 [ATYP][ADDR][PORT] 目标头（与 UDP 相同规则） ===
-    static ByteBuffer buildSsTcpTargetHeader(String host, int port) {
-        try {
-            InetAddress ip = InetAddress.getByName(host);
-            if (ip instanceof Inet4Address) {
-                return ByteBuffer.allocate(1 + 4 + 2)
-                        .put((byte) 0x01).put(ip.getAddress()).putShort((short) port).flip();
-            } else if (ip instanceof Inet6Address) {
-                return ByteBuffer.allocate(1 + 16 + 2)
-                        .put((byte) 0x04).put(ip.getAddress()).putShort((short) port).flip();
+    // === 构造 [ATYP][ADDR][PORT] 目标头（严格按握手的 ATYP 原样封装；不做解析） ===
+    static ByteBuffer buildSsTcpTargetHeader(ShakeHandResult sh) {
+        if (sh.port < 0 || sh.port > 65535) {
+            throw new IllegalArgumentException("port out of range: " + sh.port);
+        }
+
+        switch (sh.atyp & 0xFF) {
+            case 0x03: { // DOMAIN
+                byte[] name = sh.host.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+                if (name.length == 0 || name.length > 255) {
+                    throw new IllegalArgumentException("Domain length invalid: " + name.length);
+                }
+                ByteBuffer buf = ByteBuffer.allocate(1 + 1 + name.length + 2);
+                buf.put((byte)0x03).put((byte)name.length).put(name).putShort((short)(sh.port & 0xFFFF));
+                buf.flip();
+                return buf;
             }
-        } catch (Exception ignore) {}
-        byte[] name = host.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
-        if (name.length > 255) throw new IllegalArgumentException("Domain too long");
-        return ByteBuffer.allocate(1 + 1 + name.length + 2)
-                .put((byte) 0x03).put((byte) name.length).put(name).putShort((short) port).flip();
+            case 0x01: { // IPv4 字面量
+                byte[] v4 = parseIPv4Literal(sh.host);
+                ByteBuffer buf = ByteBuffer.allocate(1 + 4 + 2);
+                buf.put((byte)0x01).put(v4).putShort((short)(sh.port & 0xFFFF));
+                buf.flip();
+                return buf;
+            }
+            case 0x04: { // IPv6 字面量
+                byte[] v6 = parseIPv6Literal(sh.host); // 仅解析字面量，不做 DNS
+                ByteBuffer buf = ByteBuffer.allocate(1 + 16 + 2);
+                buf.put((byte)0x04).put(v6).putShort((short)(sh.port & 0xFFFF));
+                buf.flip();
+                return buf;
+            }
+            default:
+                throw new IllegalArgumentException("Unsupported ATYP: " + sh.atyp);
+        }
+    }
+
+    // —— 工具：只解析“字面量”地址，避免触发本地 DNS —— //
+    static byte[] parseIPv4Literal(String ip) {
+        String[] p = ip.split("\\.");
+        if (p.length != 4) throw new IllegalArgumentException("Bad IPv4 literal: " + ip);
+        byte[] b = new byte[4];
+        for (int i = 0; i < 4; i++) {
+            int v = Integer.parseInt(p[i]);
+            if (v < 0 || v > 255) throw new IllegalArgumentException("Bad IPv4 octet: " + p[i]);
+            b[i] = (byte) v;
+        }
+        return b;
+    }
+
+    static byte[] parseIPv6Literal(String ip) {
+        try {
+            // 对纯 IPv6 字面量，JDK 会直接解析为地址字节，不会发起 DNS
+            byte[] addr = java.net.InetAddress.getByName(ip).getAddress();
+            if (addr.length != 16) throw new IllegalArgumentException("Not IPv6 literal: " + ip);
+            return addr;
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Bad IPv6 literal: " + ip, e);
+        }
     }
 
     // === UDP ASSOCIATE -> UDP-over-TCP 隧道 ===
@@ -206,6 +268,8 @@ public class ProxyClient {
         ssTcp.connect(new InetSocketAddress(Config.SERVER_HOST, Config.SERVER_PORT));
 
         ClientAddrHolder holder = new ClientAddrHolder();
+
+//        AppLogger.info("UDP ASSOCIATE, local UDP port " + udpPort);
 
         // 转发：UDP<->TCP
         Thread tA = Thread.startVirtualThread(() -> pumpClientToServer(udpChannel, ssTcp, sc, holder));
@@ -328,6 +392,7 @@ public class ProxyClient {
 
             return new ShakeHandResult(
                     (cmd == 0x01 ? Command.CONNECT : Command.UDP_ASSOCIATE),
+                    atyp,
                     destAddr,
                     destPort
             );

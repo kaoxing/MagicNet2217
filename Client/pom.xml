@@ -79,6 +79,9 @@
                     <vendor>kaoxing</vendor>
                     <appVersion>1.0.0</appVersion>
 
+                    <!-- 关键：生成“控制台子系统”的启动器，可看到控制台输出 -->
+                    <winConsole>true</winConsole>
+
                     <jLinkOptions>
                         <option>--strip-debug</option>
                         <option>--no-header-files</option>
