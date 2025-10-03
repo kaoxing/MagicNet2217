@@ -48,33 +48,41 @@ public class ProxyClient {
     // ============================================================
     static final class SessionCipher {
         private static final SecureRandom RNG = new SecureRandom();
-        private static final byte[] HKDF_INFO = "ss-subkey".getBytes(StandardCharsets.US_ASCII);
 
-        private final byte[] masterKey;   // 32B
-        private final byte[] salt16;      // per-connection random
+        // 你自定义的信息串
+        private static final byte[] HKDF_INFO = "kaoxing123".getBytes(StandardCharsets.US_ASCII);
+
+        // 自定义握手前缀，避免与 libev 长得一样
+        private static final byte   PROTO_MAGIC = (byte)0xB7;
+        private static final byte   PROTO_VER   = 0x02;
+
+        // 改成 24 字节 salt
+        private static final int SALT_LEN = 24;
+
         private final SecretKeySpec subKey; // 32B -> AES key
         private final Cipher enc;
         private final Cipher dec;
-        private long sendCounter = 0;     // 96-bit nonce 的低 64 位（示例）
-        // 接收端我们不强制单调校验（可按需增加窗口校验）
+        private long sendCounter = 0;     // 96-bit nonce 的低64位
 
-        private SessionCipher(byte[] masterKey, byte[] salt16) throws Exception {
-            this.masterKey = masterKey;
-            this.salt16 = salt16;
-            byte[] sk = hkdf(masterKey, salt16, HKDF_INFO, 32);
+        private SessionCipher(byte[] masterKey, byte[] salt) throws Exception {
+            byte[] sk = hkdf(masterKey, salt, HKDF_INFO, 32);
             this.subKey = new SecretKeySpec(sk, "AES");
             Arrays.fill(sk, (byte) 0);
             this.enc = Cipher.getInstance("AES/GCM/NoPadding");
             this.dec = Cipher.getInstance("AES/GCM/NoPadding");
         }
 
-        // 建链后：客户端先发 salt(16)
+        // 客户端握手：发送 [MAGIC][VER][salt]
         static SessionCipher clientHandshake(SocketChannel ch, String password) throws IOException {
             try {
                 byte[] master = masterKeyFromPassword(password);
-                byte[] salt = new byte[16];
+                byte[] salt = new byte[SALT_LEN];
                 RNG.nextBytes(salt);
-                writeFully(ch, ByteBuffer.wrap(salt)); // 首包仅发送盐
+
+                ByteBuffer hello = ByteBuffer.allocate(2 + SALT_LEN);
+                hello.put(PROTO_MAGIC).put(PROTO_VER).put(salt).flip();
+                writeFully(ch, hello);
+
                 return new SessionCipher(master, salt);
             } catch (Exception e) {
                 throw new IOException("handshake/session init failed", e);
@@ -93,7 +101,7 @@ public class ProxyClient {
             return out;
         }
 
-        // 解密：输入含 [12B nonce][cipher|tag]
+        // 解密：输入 [12B nonce][cipher|tag]
         byte[] decrypt(byte[] packet) throws Exception {
             if (packet.length < 12 + 16) throw new IllegalArgumentException("packet too short");
             byte[] nonce = Arrays.copyOfRange(packet, 0, 12);
@@ -106,7 +114,7 @@ public class ProxyClient {
         private byte[] nextNonce12() {
             byte[] n = new byte[12];
             long x = sendCounter++;
-            // 96-bit 计数器，这里简单用低 64 位；高 32 位留 0（两端一致即可）
+            // 高32位保留 0，低64位为计数（两端一致即可）
             n[4]  = (byte)(x >>> 56);
             n[5]  = (byte)(x >>> 48);
             n[6]  = (byte)(x >>> 40);
@@ -118,21 +126,19 @@ public class ProxyClient {
             return n;
         }
 
-        // ---------- HKDF(SHA-1) ----------
+        // ---------- HKDF (HMAC-SHA1 版，与 libev 传统一致；也可换成 HMAC-SHA256) ----------
         private static byte[] hkdf(byte[] ikm, byte[] salt, byte[] info, int len) throws Exception {
-            byte[] prk = hkdfExtract(salt, ikm); // HMAC-SHA1
+            byte[] prk = hkdfExtract(salt, ikm);
             return hkdfExpand(prk, info, len);
         }
-
         private static byte[] hkdfExtract(byte[] salt, byte[] ikm) throws Exception {
-            Mac mac = Mac.getInstance("HmacSHA1");
-            mac.init(new SecretKeySpec(salt, "HmacSHA1"));
-            return mac.doFinal(ikm); // PRK
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(salt, "HmacSHA256"));
+            return mac.doFinal(ikm);
         }
-
         private static byte[] hkdfExpand(byte[] prk, byte[] info, int len) throws Exception {
-            Mac mac = Mac.getInstance("HmacSHA1");
-            mac.init(new SecretKeySpec(prk, "HmacSHA1"));
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(prk, "HmacSHA256"));
             byte[] out = new byte[len];
             byte[] t = new byte[0];
             int pos = 0;
@@ -152,8 +158,6 @@ public class ProxyClient {
         }
 
         private static byte[] masterKeyFromPassword(String password) throws Exception {
-            // 简洁起见：master = SHA-256(password)
-            // 生产更推荐：配置 32B 随机 key（Hex/Base64），省去任何 KDF。
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             return md.digest(password.getBytes(StandardCharsets.UTF_8));
         }

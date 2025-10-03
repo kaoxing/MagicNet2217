@@ -19,34 +19,45 @@ public class ProxyServer {
     // ============================ 会话加密器（与客户端一致） ============================
 
     static final class SessionCipher {
-        private static final byte[] HKDF_INFO = "ss-subkey".getBytes(StandardCharsets.US_ASCII);
+        private static final byte[] HKDF_INFO = "kaoxing123".getBytes(StandardCharsets.US_ASCII);
+        private static final byte   PROTO_MAGIC = (byte)0xB7;
+        private static final byte   PROTO_VER   = 0x02;
+        private static final int    SALT_LEN    = 24;
 
         private final SecretKeySpec subKey; // 32B
         private final Cipher enc;
         private final Cipher dec;
-        private long sendCounter = 0;       // 96-bit nonce 的低 64 位（示例）
+        private long sendCounter = 0;
 
-        private SessionCipher(byte[] masterKey, byte[] salt16) throws Exception {
-            byte[] sk = hkdf(masterKey, salt16, HKDF_INFO, 32);
+        private SessionCipher(byte[] masterKey, byte[] salt) throws Exception {
+            byte[] sk = hkdf(masterKey, salt, HKDF_INFO, 32);
             this.subKey = new SecretKeySpec(sk, "AES");
             Arrays.fill(sk, (byte) 0);
             this.enc = Cipher.getInstance("AES/GCM/NoPadding");
             this.dec = Cipher.getInstance("AES/GCM/NoPadding");
         }
 
-        // 服务器握手：读取客户端发来的 salt(16)
+        // 服务器握手：读取 [MAGIC][VER][salt]
         static SessionCipher serverHandshake(SocketChannel ch, String password) throws IOException {
             try {
                 byte[] master = masterKeyFromPassword(password);
-                byte[] salt = new byte[16];
+
+                ByteBuffer head = ByteBuffer.allocate(2);
+                readFully(head, ch); head.flip();
+                byte magic = head.get();
+                byte ver   = head.get();
+                if (magic != PROTO_MAGIC) throw new IOException("bad magic");
+                if (ver   != PROTO_VER  ) throw new IOException("bad version");
+
+                byte[] salt = new byte[SALT_LEN];
                 readFully(ByteBuffer.wrap(salt), ch);
+
                 return new SessionCipher(master, salt);
             } catch (Exception e) {
                 throw new IOException("handshake/session init failed", e);
             }
         }
 
-        // 加密：输出 [12B nonce][cipher|tag]
         byte[] encrypt(byte[] plain) throws Exception {
             byte[] nonce = nextNonce12();
             GCMParameterSpec spec = new GCMParameterSpec(128, nonce);
@@ -58,7 +69,6 @@ public class ProxyServer {
             return out;
         }
 
-        // 解密：输入含 [12B nonce][cipher|tag]
         byte[] decrypt(byte[] packet) throws Exception {
             if (packet.length < 12 + 16) throw new IllegalArgumentException("packet too short");
             byte[] nonce = Arrays.copyOfRange(packet, 0, 12);
@@ -82,21 +92,19 @@ public class ProxyServer {
             return n;
         }
 
-        // ---------- HKDF(SHA-1) ----------
+        // ---------- HKDF (HMAC-SHA1 版) ----------
         private static byte[] hkdf(byte[] ikm, byte[] salt, byte[] info, int len) throws Exception {
-            byte[] prk = hkdfExtract(salt, ikm); // HMAC-SHA1
+            byte[] prk = hkdfExtract(salt, ikm);
             return hkdfExpand(prk, info, len);
         }
-
         private static byte[] hkdfExtract(byte[] salt, byte[] ikm) throws Exception {
-            Mac mac = Mac.getInstance("HmacSHA1");
-            mac.init(new SecretKeySpec(salt, "HmacSHA1"));
-            return mac.doFinal(ikm); // PRK
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(salt, "HmacSHA256"));
+            return mac.doFinal(ikm);
         }
-
         private static byte[] hkdfExpand(byte[] prk, byte[] info, int len) throws Exception {
-            Mac mac = Mac.getInstance("HmacSHA1");
-            mac.init(new SecretKeySpec(prk, "HmacSHA1"));
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(prk, "HmacSHA256"));
             byte[] out = new byte[len];
             byte[] t = new byte[0];
             int pos = 0;

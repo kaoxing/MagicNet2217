@@ -56,7 +56,7 @@ public class Main {
                 }
             } else {
                 // 直接选择
-                Config.selectHost(1);
+                Config.selectHost(0);
             }
             ProxyClient.run();
         }catch (Exception e) {
