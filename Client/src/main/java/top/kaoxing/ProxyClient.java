@@ -1,11 +1,20 @@
 package top.kaoxing;
 
+import top.kaoxing.util.TcpLatency;
+
+import javax.crypto.Cipher;
+import javax.crypto.Mac;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 import java.io.EOFException;
 import java.io.IOException;
 import java.net.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.util.Arrays;
 
 enum Command {
     FAILED,
@@ -33,9 +42,124 @@ class ClientAddrHolder {
 }
 
 public class ProxyClient {
-    // shadowocks 代理客户端
-    // 对本地表现为一个 SOCKS5 代理服务器
-    // 支持CONNECT和UDP ASSOCIATE
+    // ============================================================
+    // 会话加密器（SS-libev 风格）：TCP 连接首包发 salt(16)，HKDF → subkey
+    // 每帧: [4B len][12B nonce][cipher|tag]
+    // ============================================================
+    static final class SessionCipher {
+        private static final SecureRandom RNG = new SecureRandom();
+        private static final byte[] HKDF_INFO = "ss-subkey".getBytes(StandardCharsets.US_ASCII);
+
+        private final byte[] masterKey;   // 32B
+        private final byte[] salt16;      // per-connection random
+        private final SecretKeySpec subKey; // 32B -> AES key
+        private final Cipher enc;
+        private final Cipher dec;
+        private long sendCounter = 0;     // 96-bit nonce 的低 64 位（示例）
+        // 接收端我们不强制单调校验（可按需增加窗口校验）
+
+        private SessionCipher(byte[] masterKey, byte[] salt16) throws Exception {
+            this.masterKey = masterKey;
+            this.salt16 = salt16;
+            byte[] sk = hkdf(masterKey, salt16, HKDF_INFO, 32);
+            this.subKey = new SecretKeySpec(sk, "AES");
+            Arrays.fill(sk, (byte) 0);
+            this.enc = Cipher.getInstance("AES/GCM/NoPadding");
+            this.dec = Cipher.getInstance("AES/GCM/NoPadding");
+        }
+
+        // 建链后：客户端先发 salt(16)
+        static SessionCipher clientHandshake(SocketChannel ch, String password) throws IOException {
+            try {
+                byte[] master = masterKeyFromPassword(password);
+                byte[] salt = new byte[16];
+                RNG.nextBytes(salt);
+                writeFully(ch, ByteBuffer.wrap(salt)); // 首包仅发送盐
+                return new SessionCipher(master, salt);
+            } catch (Exception e) {
+                throw new IOException("handshake/session init failed", e);
+            }
+        }
+
+        // 加密：输出 [12B nonce][cipher|tag]
+        byte[] encrypt(byte[] plain) throws Exception {
+            byte[] nonce = nextNonce12();
+            GCMParameterSpec spec = new GCMParameterSpec(128, nonce);
+            enc.init(Cipher.ENCRYPT_MODE, subKey, spec);
+            byte[] ct = enc.doFinal(plain);
+            byte[] out = new byte[12 + ct.length];
+            System.arraycopy(nonce, 0, out, 0, 12);
+            System.arraycopy(ct, 0, out, 12, ct.length);
+            return out;
+        }
+
+        // 解密：输入含 [12B nonce][cipher|tag]
+        byte[] decrypt(byte[] packet) throws Exception {
+            if (packet.length < 12 + 16) throw new IllegalArgumentException("packet too short");
+            byte[] nonce = Arrays.copyOfRange(packet, 0, 12);
+            byte[] ct    = Arrays.copyOfRange(packet, 12, packet.length);
+            GCMParameterSpec spec = new GCMParameterSpec(128, nonce);
+            dec.init(Cipher.DECRYPT_MODE, subKey, spec);
+            return dec.doFinal(ct);
+        }
+
+        private byte[] nextNonce12() {
+            byte[] n = new byte[12];
+            long x = sendCounter++;
+            // 96-bit 计数器，这里简单用低 64 位；高 32 位留 0（两端一致即可）
+            n[4]  = (byte)(x >>> 56);
+            n[5]  = (byte)(x >>> 48);
+            n[6]  = (byte)(x >>> 40);
+            n[7]  = (byte)(x >>> 32);
+            n[8]  = (byte)(x >>> 24);
+            n[9]  = (byte)(x >>> 16);
+            n[10] = (byte)(x >>> 8);
+            n[11] = (byte)(x);
+            return n;
+        }
+
+        // ---------- HKDF(SHA-1) ----------
+        private static byte[] hkdf(byte[] ikm, byte[] salt, byte[] info, int len) throws Exception {
+            byte[] prk = hkdfExtract(salt, ikm); // HMAC-SHA1
+            return hkdfExpand(prk, info, len);
+        }
+
+        private static byte[] hkdfExtract(byte[] salt, byte[] ikm) throws Exception {
+            Mac mac = Mac.getInstance("HmacSHA1");
+            mac.init(new SecretKeySpec(salt, "HmacSHA1"));
+            return mac.doFinal(ikm); // PRK
+        }
+
+        private static byte[] hkdfExpand(byte[] prk, byte[] info, int len) throws Exception {
+            Mac mac = Mac.getInstance("HmacSHA1");
+            mac.init(new SecretKeySpec(prk, "HmacSHA1"));
+            byte[] out = new byte[len];
+            byte[] t = new byte[0];
+            int pos = 0;
+            byte counter = 1;
+            while (pos < len) {
+                mac.reset();
+                mac.update(t);
+                if (info != null) mac.update(info);
+                mac.update(counter);
+                t = mac.doFinal();
+                int cp = Math.min(t.length, len - pos);
+                System.arraycopy(t, 0, out, pos, cp);
+                pos += cp;
+                counter++;
+            }
+            return out;
+        }
+
+        private static byte[] masterKeyFromPassword(String password) throws Exception {
+            // 简洁起见：master = SHA-256(password)
+            // 生产更推荐：配置 32B 随机 key（Hex/Base64），省去任何 KDF。
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            return md.digest(password.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    // ============================================================
 
     public static void run() throws IOException {
         // 先尝试连接上游服务器，不停重试
@@ -52,14 +176,49 @@ public class ProxyClient {
             }
         }
 
+        // 开一个线程定时测试服务器延迟，打印到日志
+        Thread.startVirtualThread(() -> {
+            while (true) {
+                try {
+                    int latency = TcpLatency.measure(Config.SERVER_HOST, Config.SERVER_PORT, 3, 1000);
+                    if (latency != Integer.MAX_VALUE) {
+                        AppLogger.info("Current latency to server " + Config.SERVER_HOST + ": " + latency + " ms");
+                    } else {
+                        AppLogger.warning("Server " + Config.SERVER_HOST + ":" + Config.SERVER_PORT + " is unreachable.");
+                        break;
+                    }
+                    Thread.sleep(20000); // 每20秒测一次
+                } catch (InterruptedException e) {
+                    break; // 线程被中断，退出
+                }
+            }
+        });
+
         try (ServerSocketChannel ssc = ServerSocketChannel.open()) {
             ssc.bind(new InetSocketAddress(Config.LOCAL_PORT));
             AppLogger.info("Proxy Client listening on port " + Config.LOCAL_PORT);
             while (true) {
                 SocketChannel sc = ssc.accept();
+                sc.setOption(StandardSocketOptions.SO_KEEPALIVE, true);
+                sc.setOption(StandardSocketOptions.TCP_NODELAY, true);
+                sc.setOption(StandardSocketOptions.SO_SNDBUF, 4 * 1024 * 1024);
+                sc.setOption(StandardSocketOptions.SO_RCVBUF, 4 * 1024 * 1024);
                 Thread.startVirtualThread(() -> handle(sc));
             }
+        } catch (Exception e) {
+            AppLogger.warning("Local server error, exiting: " + e.getMessage());
         }
+    }
+
+    static SocketChannel dialUpstream() throws IOException {
+        SocketChannel ch = SocketChannel.open();
+        ch.setOption(StandardSocketOptions.SO_KEEPALIVE, true);
+        ch.setOption(StandardSocketOptions.TCP_NODELAY, true); // 小包多时有利；用户态已做聚合
+        ch.setOption(StandardSocketOptions.SO_SNDBUF, 4 * 1024 * 1024);
+        ch.setOption(StandardSocketOptions.SO_RCVBUF, 4 * 1024 * 1024);
+        ch.configureBlocking(true);
+        ch.connect(new InetSocketAddress(Config.SERVER_HOST, Config.SERVER_PORT));
+        return ch;
     }
 
     static void handle(SocketChannel sc) {
@@ -78,16 +237,15 @@ public class ProxyClient {
                 handleUdpAssociate(sc);
             }
 
-
         } catch (IOException ignored) {}
     }
 
     // === CONNECT ===
     static void handleConnect(SocketChannel sc, ShakeHandResult shakeHandResult) throws IOException {
-        // 1) 先连上游，再回成功
-        SocketChannel ssTcp = SocketChannel.open();
-        ssTcp.configureBlocking(true);
-        ssTcp.connect(new InetSocketAddress(Config.SERVER_HOST, Config.SERVER_PORT)); // SS TCP端口
+        SocketChannel ssTcp = dialUpstream();
+
+        // ===== SS-libev风格：握手首包发送 salt，派生会话子密钥 =====
+        SessionCipher sess = SessionCipher.clientHandshake(ssTcp, Config.PASSWORD);
 
         // 回 SOCKS5 CONNECT 成功
         ByteBuffer ok = ByteBuffer.allocate(10);
@@ -96,27 +254,25 @@ public class ProxyClient {
         ok.flip();
         sc.write(ok);
 
-        // 2) 首帧发送 SS 目标头（明文）——> 加密后前置4字节密文长度
+        // 2) 首帧发送目标头（加密后发送，帧内含 [nonce][ct]）
         ByteBuffer ssHeader = buildSsTcpTargetHeader(shakeHandResult);
         byte[] hdrPlain = new byte[ssHeader.remaining()];
         ssHeader.get(hdrPlain);
-        writeCipherFrame(ssTcp, hdrPlain);
+        writeCipherFrame(ssTcp, hdrPlain, sess);
 
-//        AppLogger.info("CONNECT " + shakeHandResult.host + ":" + shakeHandResult.port);
-
-        // 3) 双向转发（显式加/解密 + 4字节密文长度前缀）
-        Thread tUp = Thread.startVirtualThread(() -> pipeClientToServer(sc, ssTcp));
-        Thread tDn = Thread.startVirtualThread(() -> pipeServerToClient(ssTcp, sc));
+        // 3) 双向转发
+        Thread tUp = Thread.startVirtualThread(() -> pipeClientToServer(sc, ssTcp, sess));
+        Thread tDn = Thread.startVirtualThread(() -> pipeServerToClient(ssTcp, sc, sess));
         try { tUp.join(); tDn.join(); } catch (InterruptedException ignored) {}
         try { ssTcp.close(); } catch (Exception ignored) {}
         try { sc.close(); } catch (Exception ignored) {}
     }
 
-    // === C -> SS：读明文 → 切片 ≤16KB → encrypt → 写 [4B cipher_len][cipher] ===
-    static final int CHUNK_MAX = 16 * 1024;
+    // === C -> SS：读明文 → 切片 ≤64KB → 会话加密 → 写 [4B frame_len][nonce+ct] ===
+    static final int CHUNK_MAX = 64 * 1024;
 
-    static void pipeClientToServer(SocketChannel sc, SocketChannel ssTcp) {
-        ByteBuffer in = ByteBuffer.allocateDirect(32 * 1024);
+    static void pipeClientToServer(SocketChannel sc, SocketChannel ssTcp, SessionCipher sess) {
+        ByteBuffer in = ByteBuffer.allocateDirect(64 * 1024);
         try {
             while (true) {
                 in.clear();
@@ -128,7 +284,7 @@ public class ProxyClient {
                     int take = Math.min(in.remaining(), CHUNK_MAX);
                     byte[] plain = new byte[take];
                     in.get(plain);
-                    writeCipherFrame(ssTcp, plain);
+                    writeCipherFrame(ssTcp, plain, sess);
                 }
             }
         } catch (IOException ignored) {
@@ -138,11 +294,11 @@ public class ProxyClient {
         }
     }
 
-    // === SS -> C：读 4B 长度 → 读密文 → decrypt → 写回 ===
-    static void pipeServerToClient(SocketChannel ssTcp, SocketChannel sc) {
+    // === SS -> C：读 [4B len][nonce+ct] → 解密 → 写回 ===
+    static void pipeServerToClient(SocketChannel ssTcp, SocketChannel sc, SessionCipher sess) {
         try {
             while (true) {
-                byte[] plain = readCipherFrameTCP(ssTcp);
+                byte[] plain = readCipherFrameTCP(ssTcp, sess);
                 if (plain == null) break;
                 writeFully(sc, ByteBuffer.wrap(plain));
             }
@@ -153,18 +309,24 @@ public class ProxyClient {
         }
     }
 
-    // === 写一帧：[4B cipher_len][cipher] ===
-    static void writeCipherFrame(WritableByteChannel ch, byte[] plain) throws IOException {
-        byte[] cipher = (Config.CRYPTION_ENABLED ? Cryptor.encrypt(plain, Config.PASSWORD) : plain);
-        if (cipher == null) cipher = new byte[0];
-
-        ByteBuffer header = ByteBuffer.allocate(4);
-        header.putInt(cipher.length);
-        header.flip();
-        writeFully(ch, header);
-
-        if (cipher.length > 0) {
-            writeFully(ch, ByteBuffer.wrap(cipher));
+    // === 写一帧：[4B frame_len][12B nonce + ciphertext|tag]，一次聚合写 ===
+    static void writeCipherFrame(WritableByteChannel ch, byte[] plain, SessionCipher sess) throws IOException {
+        try {
+            byte[] packet = sess.encrypt(plain); // [nonce(12)|ct|tag]
+            ByteBuffer header = ByteBuffer.allocate(4).putInt(packet.length);
+            header.flip();
+            ByteBuffer body = ByteBuffer.wrap(packet);
+            // gather write
+            ByteBuffer[] arr = { header, body };
+            long need = header.remaining() + body.remaining();
+            long written = 0;
+            while (written < need) {
+                long n = ((GatheringByteChannel) ch).write(arr);
+                if (n <= 0) continue;
+                written += n;
+            }
+        } catch (Exception e) {
+            throw new IOException("encrypt/write failed", e);
         }
     }
 
@@ -233,7 +395,6 @@ public class ProxyClient {
 
     static byte[] parseIPv6Literal(String ip) {
         try {
-            // 对纯 IPv6 字面量，JDK 会直接解析为地址字节，不会发起 DNS
             byte[] addr = java.net.InetAddress.getByName(ip).getAddress();
             if (addr.length != 16) throw new IllegalArgumentException("Not IPv6 literal: " + ip);
             return addr;
@@ -242,7 +403,7 @@ public class ProxyClient {
         }
     }
 
-    // === UDP ASSOCIATE -> UDP-over-TCP 隧道 ===
+    // === UDP ASSOCIATE -> UDP-over-TCP 隧道（同一 TCP 会话加密器） ===
     static void handleUdpAssociate(SocketChannel sc) throws IOException {
         // 给本地应用回 SOCKS5 UDP 成功 & 分配一个本地 UDP 端口供其发送
         ByteBuffer buf = ByteBuffer.allocate(10);
@@ -262,17 +423,13 @@ public class ProxyClient {
         sc.write(buf);
 
         // 与服务端建立 TCP 隧道（承载 UDP 内帧）
-        SocketChannel ssTcp = SocketChannel.open();
-        ssTcp.configureBlocking(true);
-        ssTcp.connect(new InetSocketAddress(Config.SERVER_HOST, Config.SERVER_PORT));
+        SocketChannel ssTcp = dialUpstream();
+        SessionCipher sess = SessionCipher.clientHandshake(ssTcp, Config.PASSWORD);
 
         ClientAddrHolder holder = new ClientAddrHolder();
 
-//        AppLogger.info("UDP ASSOCIATE, local UDP port " + udpPort);
-
-        // 转发：UDP<->TCP
-        Thread tA = Thread.startVirtualThread(() -> pumpClientToServer(udpChannel, ssTcp, sc, holder));
-        Thread tB = Thread.startVirtualThread(() -> pumpServerToClient(udpChannel, ssTcp, sc, holder));
+        Thread tA = Thread.startVirtualThread(() -> pumpClientToServer(udpChannel, ssTcp, sc, holder, sess));
+        Thread tB = Thread.startVirtualThread(() -> pumpServerToClient(udpChannel, ssTcp, sc, holder, sess));
 
         // 维持 TCP 控制信道直到本地关闭
         ByteBuffer sink = ByteBuffer.allocate(1);
@@ -290,14 +447,13 @@ public class ProxyClient {
         }
     }
 
-
     static void readFully(SocketChannel sc, ByteBuffer buf) throws IOException {
         while (buf.hasRemaining()) {
             if (sc.read(buf) < 0) throw new EOFException("stream closed");
         }
     }
 
-    // === SOCKS5 握手 ===
+    // === SOCKS5 握手（原样） ===
     static ShakeHandResult socks5ShakeHand(SocketChannel sc) {
         ByteBuffer buf = ByteBuffer.allocate(2);
         try {
@@ -317,8 +473,6 @@ public class ProxyClient {
             readFully(sc, buf);
             buf.flip();
 
-            // 支持0x00:noAuth和0x02:用户/密码两种认证方式
-            // 但是取决于本地config
             if (!Config.AUTHENTICATION_ENABLED){
                 boolean noAuth = false;
                 for (int i = 0; i < nMethods; i++) {
@@ -335,7 +489,6 @@ public class ProxyClient {
 
             // 2. 服务器选择认证方法
             if(Config.AUTHENTICATION_ENABLED){
-                // 选择 0x02:用户名/密码认证
                 buf = ByteBuffer.allocate(2);
                 buf.put((byte) 0x05);
                 buf.put((byte) 0x02);
@@ -343,7 +496,6 @@ public class ProxyClient {
                 sc.write(buf);
 
                 // 用户名/密码认证子协商
-                // 读取版本号、用户名长度、用户名、密码长度、密码
                 buf = ByteBuffer.allocate(2);
                 readFully(sc, buf);
                 buf.flip();
@@ -374,10 +526,8 @@ public class ProxyClient {
                 byte[] passwdBytes = new byte[plen];
                 buf.get(passwdBytes);
                 String password = new String(passwdBytes, StandardCharsets.US_ASCII);
-                // 验证用户名和密码
                 if (!username.equals(Config.USERNAME) || !password.equals(Config.AUTH_PASSWORD)) {
                     AppLogger.warning("Authentication failed for user: " + username);
-                    // 认证失败
                     buf = ByteBuffer.allocate(2);
                     buf.put((byte) 0x01);
                     buf.put((byte) 0x01); // 失败
@@ -385,7 +535,6 @@ public class ProxyClient {
                     sc.write(buf);
                     return ShakeHandResult.FAILED;
                 } else {
-                    // 认证成功
                     buf = ByteBuffer.allocate(2);
                     buf.put((byte) 0x01);
                     buf.put((byte) 0x00); // 成功
@@ -393,14 +542,12 @@ public class ProxyClient {
                     sc.write(buf);
                 }
             }else{
-                // 选择 0x00:无认证
                 buf = ByteBuffer.allocate(2);
                 buf.put((byte) 0x05);
                 buf.put((byte) 0x00);
                 buf.flip();
                 sc.write(buf);
             }
-
 
             // 3. 客户端请求
             buf = ByteBuffer.allocate(4);
@@ -476,7 +623,8 @@ public class ProxyClient {
     static void pumpClientToServer(DatagramChannel udpChannel,
                                    SocketChannel serverTCPChannel,
                                    SocketChannel sc,
-                                   ClientAddrHolder holder) {
+                                   ClientAddrHolder holder,
+                                   SessionCipher sess) {
         ByteBuffer in = ByteBuffer.allocate(65536);  // UDP max
         ByteBuffer out = ByteBuffer.allocate(65536);
 
@@ -523,8 +671,8 @@ public class ProxyClient {
                 // 构造“内层 UDP 帧”：FT=0x01 + [ATYP][DST][PORT] + [2B LEN] + DATA
                 byte[] inner = buildInnerUdpFrame((byte) 0x01, atyp, dst, portBE, payload);
 
-                // 外层加密帧 [4B len][cipher] 写 TCP
-                writeCipherFrame(serverTCPChannel, inner);
+                // 外层加密帧 [4B len][nonce+ct] 写 TCP
+                writeCipherFrame(serverTCPChannel, inner, sess);
             }
         } catch (Exception e) {
             try { sc.close(); } catch (Exception ignored) {}
@@ -537,13 +685,14 @@ public class ProxyClient {
     static void pumpServerToClient(DatagramChannel udpChannel,
                                    SocketChannel serverTCPChannel,
                                    SocketChannel sc,
-                                   ClientAddrHolder holder) {
+                                   ClientAddrHolder holder,
+                                   SessionCipher sess) {
         ByteBuffer out = ByteBuffer.allocate(65536);
 
         try {
             while (true) {
-                // 读一帧 TCP：[4B len][cipher] -> 解密得到 inner
-                byte[] inner = readCipherFrameTCP(serverTCPChannel);
+                // 读一帧 TCP：[4B len][nonce+ct] -> 解密得到 inner
+                byte[] inner = readCipherFrameTCP(serverTCPChannel, sess);
                 if (inner == null || inner.length == 0) continue;
 
                 ByteBuffer p = ByteBuffer.wrap(inner);
@@ -619,18 +768,22 @@ public class ProxyClient {
     }
 
     // 从 TCP 读取一帧并解密为 inner 明文
-    static byte[] readCipherFrameTCP(SocketChannel ch) throws IOException {
+    static byte[] readCipherFrameTCP(SocketChannel ch, SessionCipher sess) throws IOException {
         ByteBuffer hdr = ByteBuffer.allocate(4);
         if (!readFully(hdr, ch)) return null; // EOF
         hdr.flip();
         int clen = hdr.getInt();
-        if (clen < 0 || clen > 64 * 1024 + 2048) throw new IOException("Bad frame len: " + clen);
+        if (clen < 0 || clen > 64 * 1024 + 4096) throw new IOException("Bad frame len: " + clen);
         ByteBuffer cbuf = ByteBuffer.allocate(clen);
         if (!readFully(cbuf, ch)) throw new IOException("EOF on TCP body");
         cbuf.flip();
-        byte[] cipher = new byte[cbuf.remaining()];
-        cbuf.get(cipher);
-        return Config.CRYPTION_ENABLED ? Cryptor.decrypt(cipher, Config.PASSWORD) : cipher;
+        byte[] packet = new byte[cbuf.remaining()];
+        cbuf.get(packet);
+        try {
+            return sess.decrypt(packet); // packet = [nonce|ct]
+        } catch (Exception e) {
+            throw new IOException("decrypt failed", e);
+        }
     }
 
     // 解析 inner 帧里的 [ATYP][ADDR][PORT]

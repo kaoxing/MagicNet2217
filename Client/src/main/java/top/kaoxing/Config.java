@@ -6,6 +6,7 @@ import java.util.List;
 
 class ConfigData {
     public int listen_port;
+    public String query_host;
     public int server_port;
     public boolean enable_authentication;
     public String username;
@@ -13,16 +14,11 @@ class ConfigData {
     public boolean use_encryption;
     public String encryption_key;
     public boolean desktop;
-
-    public List<Host> server_hosts;
-
-    public static class Host {
-        public String host_name;
-    }
 }
 
 public class Config {
-    public static List<ConfigData.Host> server_hosts;
+    public static List<String> server_hosts;
+    public static String QUERY_HOST;
     public static String SERVER_HOST;
     public static final int SERVER_PORT;
     public static final int LOCAL_PORT;
@@ -36,7 +32,7 @@ public class Config {
         Yaml yaml = new Yaml();
         InputStream inputStream = Config.class.getClassLoader().getResourceAsStream("config.yml");
         ConfigData configData = yaml.loadAs(inputStream, ConfigData.class);
-        server_hosts = configData.server_hosts;
+        QUERY_HOST = configData.query_host;
         SERVER_PORT = configData.server_port;
         LOCAL_PORT = configData.listen_port;
         PASSWORD = configData.encryption_key;
@@ -50,7 +46,7 @@ public class Config {
         if (index < 0 || index >= server_hosts.size()) {
             throw new IndexOutOfBoundsException("Index out of bounds: " + index);
         }
-        SERVER_HOST = server_hosts.get(index).host_name;
+        SERVER_HOST = server_hosts.get(index);
     }
     public static void setHost(String host){
         SERVER_HOST = host;
